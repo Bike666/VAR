@@ -1,0 +1,460 @@
+---
+title: "454835_homework"
+author: "Shuai Hu "
+date: "2024"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      toc_collapsed: true
+    toc_depth: 5
+    number_sections: false
+    theme: readable
+---
+
+
+
+```{r }
+library(xts)
+library(ggplot2)
+library(utils)
+library(rugarch)
+library(GAS)
+library(ROCR)
+library(randomForest)
+library(xgboost)
+library(scorecard)
+library(caret)
+library(pROC)
+library(tidyverse)
+Sys.setlocale("LC_TIME", "English")
+```
+
+
+## Exercise 1.1
+
+Import quotations for any asset of your choice using either provided files or
+quantmod package from first labs. Then calculate logarithmic returns on that
+asset and compare Value-at-Risk estimates for 2021 from historical simulation,
+GARCH models and filtered historical simulation (models should be built on the
+data prior to 01-01-2021 with moving window method). Does the quality of the
+models change? Are some approaches much better than the others? What caused
+such behavior? Plot the VaR estimates together with data.
+
+
+### Let us use spx file
+```{r }
+ukx_index_data <- read.csv("C:\\Users\\Lenovo\\OneDrive\\AAA Warsaw University\\The 3rd semester\\Applied Finance lab\\lab04\\drive-download-20231217T193414Z-001\\ukx.csv", stringsAsFactors = F)
+ukx_index_data.xts <- xts(ukx_index_data[,-1],
+                      as.Date(ukx_index_data[, 1], "%Y-%m-%d"))
+```
+
+```{r }
+p_value <- 0.025
+forecast_horizon <- 250
+```
+
+
+```{r }
+ukx_log_returns <- diff(log(ukx_index_data.xts$Close), lag = 1)
+ukx_data <- ukx_log_returns["1995/2020"]
+
+```
+
+```{r }
+nrow(ukx_data)
+ukx_training_sample_len <- nrow(ukx_data) - forecast_horizon
+plot(ukx_data)
+addEventLines(
+  events = xts("testing sample", index(ukx_data[nrow(ukx_data) - forecast_horizon + 1])),
+  col = "red",
+  srt = 270,
+  pos = 4
+)
+
+```
+
+
+## Modeling
+
+### Historical simulation
+
+```{r }
+ukx_rollHS <- rollapplyr(ukx_data, ukx_training_sample_len,
+                     function(w) {
+                       quantile(w, p_value)
+                     })
+```
+
+```{r }
+ukx_testHS <- tail(lag(ukx_rollHS, 1), 250)
+```
+
+```{r }
+specnorm <-
+  ugarchspec(
+    variance.model = list(model="sGARCH", garchOrder=c(1, 1)),
+    mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+    distribution.model = 'norm'
+  )
+
+rollnorm <- ugarchroll(
+  specnorm,
+  ukx_data,
+  n.ahead = 1,
+  forecast.length = forecast_horizon,
+  refit.every = 1,
+  refit.window = 'moving',
+  keep.coef = TRUE,
+  calculate.VaR = TRUE,
+  VaR.alpha = p_value
+)
+```
+
+```{r }
+testGarchNORM <- xts(rollnorm@forecast$VaR,
+                     as.Date(rownames(rollnorm@forecast$VaR)))[, 1]
+
+plot(cbind(tail(ukx_data, 250), rollnorm@forecast$density$Sigma))
+
+```
+
+
+### GARCH(1,1) with skewed normal distribution
+
+```{r }
+
+specSnorm <-
+  ugarchspec(
+    variance.model = list(model="sGARCH", garchOrder=c(1, 1)),
+    mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+    distribution.model = 'snorm'
+  )
+
+
+rollSnorm <-
+  ugarchroll(
+    specSnorm,
+    ukx_data,
+    n.ahead = 1,
+    forecast.length = forecast_horizon,
+    refit.every = 1,
+    refit.window = 'moving',
+    keep.coef = TRUE,
+    calculate.VaR = TRUE,
+    VaR.alpha = p_value
+  )
+
+
+testGarchSNORM <- xts(rollSnorm@forecast$VaR,
+                      as.Date(rownames(rollSnorm@forecast$VaR)))[, 1]
+
+plot(cbind(tail(ukx_data, 250), rollSnorm@forecast$density$Sigma))
+```
+
+
+### Filtered Historical Simulation (by GARCH(1,1))
+
+```{r }
+rollFHS <- rollapplyr(ukx_data, ukx_training_sample_len,
+                      function(ukx_data) {
+                        
+                        fit <- ugarchfit(specnorm, ukx_data)
+                        
+                        res <- rugarch::residuals(fit, standardize = T)
+                       
+                        hat <-
+                          sqrt(
+                            fit@fit$coef['omega'] + fit@fit$coef['alpha1'] * tail(rugarch::residuals(fit), 1) ^
+                              2 + fit@fit$coef['beta1'] * tail(sigma(fit), 1) ^ 2
+                          )
+                        
+                        draw <- sample(res, 20000, replace = T)
+                       
+                        draw_var <- quantile(draw, p_value)
+                       
+                        var <- draw_var * as.numeric(hat)
+                          return(var)
+                      })
+
+
+testFHS <- tail(lag(rollFHS, 1), 250)
+
+```
+
+```{r }
+testRealised <- tail(ukx_data, 250)
+
+```
+
+```{r }
+var_predictions <- cbind(ukx_testHS,
+                         testFHS,
+                         testGarchNORM,
+                         testGarchSNORM
+                         )
+colnames(var_predictions) <-
+  c("HS","FHS","GARCH Norm", "GARCH SNORM")
+```
+
+```{r }
+
+excess_count <- function(var, true) {
+
+  return(sum(ifelse(coredata(var) > coredata(true), 1, 0)))
+}
+
+sapply(var_predictions, excess_count, true = testRealised)
+
+
+VaRTest(p_value, testRealised, ukx_testHS)
+
+sapply(var_predictions, function(var) {
+  c(
+    "Kupiec"=VaRTest(p_value, testRealised, var)$uc.Decision,
+    "Christoffersen"=VaRTest(p_value, testRealised, var)$cc.Decision
+  )
+})
+
+# plot with VaRs
+ggplot(testRealised, aes(index(testRealised), indeks)) +
+  geom_line(aes(y = testGarchNORM, colour = "Garch NORM"), size = 1) +
+  geom_line(aes(y = testGarchSNORM, colour = "Garch SNORM"), size = 1) +
+  geom_line(aes(y = ukx_testHS, colour = "HS"), size = 1) +
+  geom_line(aes(y = testFHS, colour = "FHS"), size = 1) +
+  geom_point(aes(y = testRealised), size = 1) +
+  scale_x_date(date_minor_breaks = "1 day") +  scale_colour_manual(
+    "",
+    breaks = c("Garch NORM", "Garch SNORM", "HS", "FHS"),
+    values = c("red", "green", "blue", "yellow")
+  ) +
+  xlab("") + ylab("Returns and VaRs")
+```
+
+
+
+The accuracy of VaR estimations can be affected by the model specifications (GARCH) and distributional assumptions (normal vs. skewed normal).
+The features of the financial asset and the market dynamics during the studied time may have an impact on the models' performance.
+ The results indicate that the FHS and GARCH SNORM models performed similarly and did not significantly deviate from actual exceedances for the provided data and time period. The HS models, revealed notable distinctions, suggesting that additional improvement or investigation of different modeling strategies may be necessary.
+
+
+
+
+
+## Exercise 1.2
+
+
+Load the data for the credit risk applications. Run necessary preprocessing
+steps. Train logistic regression, random forest and xgboost models. Compare
+the models performance for AUC. Are the ML models better or worse than logistic
+regression? Choose a probability of default threshold level for one of the
+models and justify your selection.
+
+
+```{r }
+data <- read.csv("C:\\Users\\Lenovo\\OneDrive\\AAA Warsaw University\\The 3rd semester\\Applied Finance lab\\lab04\\drive-download-20231217T193414Z-001\\german_credit.csv", stringsAsFactors = T)
+
+```
+
+
+
+
+
+```{r }
+glimpse(data)
+
+data$property <- as.factor(data$property)
+data$age <- as.numeric(data$age)
+data$credit_amount <- as.double(data$credit_amount)
+
+data$default<- as.factor(data$default)
+
+data$credit_amount <-
+  as.factor(ifelse(
+    data$credit_amount <= 2500, '0-2500',
+    ifelse(data$credit_amount <= 5000, '2501-5000', '5000+')
+  ))
+
+
+data <- data[complete.cases(data),]
+
+
+set.seed(123456)
+d = sort(sample(nrow(data), nrow(data) * .6))
+train <- data[d, ]
+test <- data[-d, ]
+
+
+```
+```{r }
+model <- default ~ .
+
+```
+
+### logistic regression
+
+```{r }
+model_lr <- glm(model, data = train, family = binomial())
+
+
+
+predict <- predict(model_lr, type = 'response', newdata = train)
+
+
+table(train$default, predict > 0.5)
+
+
+ROCpred <- prediction(predict, train$default)
+ROCperf <- performance(ROCpred, 'tpr', 'fpr')
+plot(ROCperf)
+
+
+auc <- performance(ROCpred, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+
+```
+
+
+```{r }
+predict <- predict(model_lr, type = 'response', newdata = test)
+
+
+table(test$default, predict > 0.5)
+
+
+ROCpred <- prediction(predict, test$default)
+ROCperf <- performance(ROCpred, 'tpr', 'fpr')
+plot(ROCperf)
+
+
+auc <- performance(ROCpred, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+```
+
+```{r }
+levels(train$default) <- c("level_0", "level_1")
+levels(test$default) <- c("level_0", "level_1")
+```
+
+
+### random forest
+
+```{r }
+rf <- 
+  randomForest(model,
+               data = train,
+               ntree = 100,
+               sampsize = nrow(train),
+               mtry = 8,
+               
+               nodesize = 100,
+               
+               importance = TRUE)
+```
+
+```{r }
+pred.train.rf <- predict(rf, 
+                             train, 
+                         type = "prob")[, "level_0"]
+
+ROC.train.rf  <- roc(as.numeric(train$default == "level_0"), 
+                        pred.train.rf)
+
+pred.test.rf  <- predict(rf, 
+                             test, 
+                         type = "prob")[, "level_0"]
+
+ROC.test.rf   <- roc(as.numeric(test$default == "level_0"), 
+                         pred.test.rf)
+
+ROC.test.rf
+```
+
+```{r }
+plot(ROC.test.rf, main = "ROC Curve", col = "blue", lwd = 2)
+```
+
+
+### XGboost
+```{r, warning=FALSE }
+
+
+parameters_xgb <- expand.grid(nrounds = 110,
+                               max_depth = 5,
+                               eta = c(0.25), 
+                               gamma = 0.2,
+                               colsample_bytree = 0.2,
+                               min_child_weight = 40,
+                               subsample = c(0.9))
+
+ctrl_cv5 <- trainControl(method = "cv", 
+                         number = 5,
+                         classProbs = TRUE,
+                         summaryFunction = twoClassSummary)
+
+
+xgb <- train(model,
+                     data = train,
+                     method = "xgbTree",
+                     trControl = ctrl_cv5,
+                     tuneGrid  = parameters_xgb)
+
+```
+
+
+```{r }
+ROC.train <- pROC::roc(train$default, 
+                       predict(xgb,
+                               train, type = "prob")[, "level_0"])
+ROC.test  <- pROC::roc(test$default, 
+                       predict(xgb,
+                               test, type = "prob")[, "level_0"])
+
+ROC.test
+```
+
+
+```{r }
+plot(ROC.test, main = "ROC Curve", col = "blue", lwd = 2)
+
+```
+```{r }
+# now let's see how that changes on testing sample
+predict_LR <- predict(model_lr, type = 'response', newdata = test)
+
+# confusion matrix for training set
+table(test$default, predict_LR > 0.5)
+
+# ROC Curve
+ROCpred_t <- prediction(predict_LR, test$default)
+ROCperf_t <- performance(ROCpred_t, 'tpr', 'fpr')
+plot(ROCperf_t)
+
+# AUC value
+auc_t <- performance(ROCpred_t, measure = "auc")
+auc_t <- auc_t@y.values[[1]]
+auc_t
+
+
+
+# influence of the threshold on the default criterion
+table(test$default, predict_LR > 0.2)
+table(test$default, predict_LR > 0.7)
+
+best_threshold_index <- which.max(ROCperf_t@y.values[[1]] - ROCperf_t@x.values[[1]])
+
+
+best_threshold <- ROCperf_t@alpha.values[[1]][best_threshold_index]
+
+
+print(paste("Best Threshold:", best_threshold))
+
+```
+
+
+
+The Test AUC from basic logistic regression is 0.764, basic random forest is 0.76, and basic xgboost models are 0.65. So logistic regression and random forest have good prediction, but those models can be improved of course. 
+
+Here we use logistic regression and the best Threshold is 0.204318649337941.
